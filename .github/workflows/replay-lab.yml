@@ -1,0 +1,294 @@
+name: Historical SHA replay lab
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  actions: read
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  observer:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record pull request event
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf 'observer_at=%s\naction=%s\nhead_sha=%s\n' \
+            "$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" "$EVENT_ACTION" "$EVENT_HEAD_SHA"
+
+  lab:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LAB_BRANCH: replay-pr
+    steps:
+      - name: Run harmless replay validation
+        id: lab
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          REPO="${GITHUB_REPOSITORY}"
+
+          now() { date -u +'%Y-%m-%dT%H:%M:%S.%NZ'; }
+
+          api() {
+            gh api -H 'Accept: application/vnd.github+json' "$@"
+          }
+
+          create_blob() {
+            api -X POST "repos/${REPO}/git/blobs" -f content="$1" -f encoding=utf-8 --jq .sha
+          }
+
+          create_tree() {
+            local base_tree="$1" blob="$2"
+            api -X POST "repos/${REPO}/git/trees" \
+              -f base_tree="$base_tree" \
+              -f 'tree[][path]=marker.txt' \
+              -f 'tree[][mode]=100644' \
+              -f 'tree[][type]=blob' \
+              -f "tree[][sha]=${blob}" --jq .sha
+          }
+
+          create_commit() {
+            local message="$1" tree="$2" parent="$3"
+            api -X POST "repos/${REPO}/git/commits" \
+              -f message="$message" -f tree="$tree" -f "parents[]=${parent}" --jq .sha
+          }
+
+          move_ref() {
+            local sha="$1" force="$2" label="$3"
+            local started response completed
+            started="$(now)"
+            response="$(api -X PATCH "repos/${REPO}/git/refs/heads/${LAB_BRANCH}" \
+              -f sha="$sha" -F force="$force")"
+            completed="$(now)"
+            jq -n --arg label "$label" --arg started "$started" --arg completed "$completed" \
+              --argjson response "$response" \
+              '{label:$label,request_started_at:$started,response_received_at:$completed,response:$response}' \
+              > "evidence/${label}-ref-update.json"
+          }
+
+          create_comment() {
+            local body="$1" label="$2" response
+            response="$(api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" -f body="$body")"
+            printf '%s\n' "$response" > "evidence/${label}-comment.json"
+            jq -r .created_at <<<"$response"
+          }
+
+          runs_for_sha() {
+            api "repos/${REPO}/actions/runs?head_sha=$1&event=pull_request&per_page=100"
+          }
+
+          wait_for_any_run() {
+            local sha="$1" label="$2" i response count
+            for i in $(seq 1 160); do
+              response="$(runs_for_sha "$sha")"
+              count="$(jq '.workflow_runs | length' <<<"$response")"
+              if [[ "$count" -gt 0 ]]; then
+                jq -n --arg observed_at "$(now)" --arg sha "$sha" --argjson response "$response" \
+                  '{observed_at:$observed_at,sha:$sha,response:$response}' \
+                  > "evidence/${label}-first-visible-runs.json"
+                return 0
+              fi
+              sleep 0.25
+            done
+            jq -n --arg observed_at "$(now)" --arg sha "$sha" \
+              '{observed_at:$observed_at,sha:$sha,error:"no pull_request run became visible"}' \
+              > "evidence/${label}-first-visible-runs.json"
+            return 1
+          }
+
+          wait_for_run_after() {
+            local sha="$1" after="$2" label="$3" i response count
+            for i in $(seq 1 160); do
+              response="$(runs_for_sha "$sha")"
+              count="$(jq --arg after "$after" '[.workflow_runs[] | select(.created_at > $after)] | length' <<<"$response")"
+              if [[ "$count" -gt 0 ]]; then
+                jq -n --arg observed_at "$(now)" --arg sha "$sha" --arg after "$after" \
+                  --argjson response "$response" \
+                  '{observed_at:$observed_at,sha:$sha,required_after:$after,response:$response}' \
+                  > "evidence/${label}-first-visible-runs.json"
+                return 0
+              fi
+              sleep 0.25
+            done
+            jq -n --arg observed_at "$(now)" --arg sha "$sha" --arg after "$after" \
+              '{observed_at:$observed_at,sha:$sha,required_after:$after,error:"no later pull_request run became visible"}' \
+              > "evidence/${label}-first-visible-runs.json"
+            return 1
+          }
+
+          capture_decision_from_pr() {
+            local label="$1" comment_at="$2" pr_observed_at="$3" pr_json="$4"
+            local head_sha runs_started_at runs_json runs_received_at branch_ref_json
+            local branch_ref_at pull_ref_at pull_ref last_run decision reason marker_b64 marker
+            head_sha="$(jq -r .head.sha <<<"$pr_json")"
+            runs_started_at="$(now)"
+            runs_json="$(runs_for_sha "$head_sha")"
+            runs_received_at="$(now)"
+            last_run="$(jq -r '[.workflow_runs[].created_at] | max // empty' <<<"$runs_json")"
+            if [[ -z "$last_run" ]]; then
+              decision=REJECT
+              reason=no-pull-request-run
+            elif [[ "$last_run" > "$comment_at" ]]; then
+              decision=REJECT
+              reason=latest-run-is-later
+            else
+              decision=ACCEPT
+              reason=no-run-is-strictly-later
+            fi
+            branch_ref_at="$(now)"
+            branch_ref_json="$(api "repos/${REPO}/git/ref/heads/${LAB_BRANCH}")"
+            pull_ref_at="$(now)"
+            pull_ref="$(git ls-remote "https://github.com/${REPO}.git" "refs/pull/${PR_NUMBER}/head" || true)"
+            marker='not-read'
+            if [[ "$decision" == ACCEPT ]]; then
+              marker_b64="$(api "repos/${REPO}/contents/marker.txt?ref=${head_sha}" --jq .content | tr -d '\n')"
+              marker="$(printf '%s' "$marker_b64" | base64 -d)"
+            fi
+            jq -n \
+              --arg label "$label" --arg comment_at "$comment_at" \
+              --arg pr_observed_at "$pr_observed_at" --arg runs_started_at "$runs_started_at" \
+              --arg runs_received_at "$runs_received_at" --arg branch_ref_at "$branch_ref_at" \
+              --arg pull_ref_at "$pull_ref_at" --arg pull_ref "$pull_ref" \
+              --arg last_run "$last_run" --arg decision "$decision" --arg reason "$reason" \
+              --arg marker "$marker" --argjson pr "$pr_json" --argjson runs "$runs_json" \
+              --argjson branch_ref "$branch_ref_json" \
+              '{label:$label,comment_at:$comment_at,pr_observed_at:$pr_observed_at,
+                runs_request_started_at:$runs_started_at,runs_response_received_at:$runs_received_at,
+                branch_ref_observed_at:$branch_ref_at,pull_ref_observed_at:$pull_ref_at,
+                decision:$decision,reason:$reason,last_run_created_at:$last_run,marker:$marker,
+                pr:$pr,branch_ref:$branch_ref,pull_ref_ls_remote:$pull_ref,runs:$runs}' \
+              > "evidence/${label}-decision.json"
+            cat "evidence/${label}-decision.json"
+          }
+
+          wait_for_head_and_decide() {
+            local expected="$1" comment_at="$2" label="$3" i observed pr_json actual
+            for i in $(seq 1 300); do
+              observed="$(now)"
+              pr_json="$(api "repos/${REPO}/pulls/${PR_NUMBER}")"
+              actual="$(jq -r .head.sha <<<"$pr_json")"
+              if [[ "$actual" == "$expected" ]]; then
+                capture_decision_from_pr "$label" "$comment_at" "$observed" "$pr_json"
+                return 0
+              fi
+              sleep 0.10
+            done
+            jq -n --arg observed_at "$(now)" --arg expected "$expected" \
+              '{observed_at:$observed_at,expected:$expected,error:"expected head never observed"}' \
+              > "evidence/${label}-decision.json"
+            return 1
+          }
+
+          snapshot_current() {
+            local label="$1" comment_at="$2" observed pr_json
+            observed="$(now)"
+            pr_json="$(api "repos/${REPO}/pulls/${PR_NUMBER}")"
+            capture_decision_from_pr "$label" "$comment_at" "$observed" "$pr_json"
+          }
+
+          MAIN_SHA="$(api "repos/${REPO}/git/ref/heads/main" --jq .object.sha)"
+          MAIN_TREE="$(api "repos/${REPO}/git/commits/${MAIN_SHA}" --jq .tree.sha)"
+          B_BLOB="$(create_blob 'BENIGN_APPROVED_REVISION')"
+          B_TREE="$(create_tree "$MAIN_TREE" "$B_BLOB")"
+          B_SHA="$(create_commit 'lab: benign approved parent B' "$B_TREE" "$MAIN_SHA")"
+          M_BLOB="$(create_blob 'RESTORED_UNAUTHORIZED_REVISION')"
+          M_TREE="$(create_tree "$B_TREE" "$M_BLOB")"
+          M_SHA="$(create_commit 'lab: harmless restored child M' "$M_TREE" "$B_SHA")"
+          N_BLOB="$(create_blob 'NEW_UNSEEN_POST_APPROVAL_REVISION')"
+          N_TREE="$(create_tree "$B_TREE" "$N_BLOB")"
+          N_SHA="$(create_commit 'lab: harmless never-before-seen child N' "$N_TREE" "$B_SHA")"
+          jq -n --arg main "$MAIN_SHA" --arg b "$B_SHA" --arg m "$M_SHA" --arg n "$N_SHA" \
+            '{main:$main,B:$b,M:$m,N:$n}' > evidence/commit-shas.json
+
+          api -X POST "repos/${REPO}/git/refs" -f "ref=refs/heads/${LAB_BRANCH}" -f sha="$M_SHA" \
+            > evidence/create-branch-response.json
+          PR_JSON="$(api -X POST "repos/${REPO}/pulls" -f title='Disposable historical SHA replay validation' \
+            -f head="$LAB_BRANCH" -f base=main \
+            -f body='Harmless automated validation. No secrets, releases, packages, or publication.')"
+          printf '%s\n' "$PR_JSON" > evidence/create-pr-response.json
+          PR_NUMBER="$(jq -r .number <<<"$PR_JSON")"
+          printf '%s\n' "$PR_NUMBER" > evidence/pr-number.txt
+
+          if ! wait_for_any_run "$M_SHA" initial-M; then
+            jq -n --arg verdict BLOCKED --arg reason 'GITHUB_TOKEN-created PR produced no pull_request run' \
+              '{verdict:$verdict,reason:$reason}' > evidence/summary.json
+            cat evidence/summary.json
+            exit 0
+          fi
+
+          move_ref "$B_SHA" true reset-to-B-before-approval
+          wait_for_any_run "$B_SHA" reset-B || true
+
+          BASELINE_COMMENT_AT="$(create_comment 'ok-to-build-image baseline unchanged B' baseline)"
+          snapshot_current baseline-unchanged-B "$BASELINE_COMMENT_AT"
+
+          OPEN_COMMENT_AT="$(create_comment 'ok-to-build-image open replay M' open-replay)"
+          (sleep 0.50; move_ref "$M_SHA" false open-fast-forward-to-M) &
+          OPEN_UPDATE_PID=$!
+          wait_for_head_and_decide "$M_SHA" "$OPEN_COMMENT_AT" open-replay-first-observation || true
+          wait "$OPEN_UPDATE_PID"
+          wait_for_run_after "$M_SHA" "$OPEN_COMMENT_AT" open-new-M-run || true
+          snapshot_current open-replay-after-run-visible "$OPEN_COMMENT_AT"
+
+          move_ref "$B_SHA" true reset-to-B-for-fresh-control
+          wait_for_any_run "$B_SHA" fresh-control-B || true
+          FRESH_COMMENT_AT="$(create_comment 'ok-to-build-image fresh unseen N control' fresh-control)"
+          (sleep 0.50; move_ref "$N_SHA" false fresh-fast-forward-to-N) &
+          FRESH_UPDATE_PID=$!
+          wait_for_head_and_decide "$N_SHA" "$FRESH_COMMENT_AT" fresh-N-first-observation || true
+          wait "$FRESH_UPDATE_PID"
+          wait_for_run_after "$N_SHA" "$FRESH_COMMENT_AT" fresh-new-N-run || true
+          snapshot_current fresh-N-after-run-visible "$FRESH_COMMENT_AT"
+
+          move_ref "$B_SHA" true reset-to-B-for-closed
+          wait_for_any_run "$B_SHA" closed-control-B || true
+          CLOSED_COMMENT_AT="$(create_comment 'ok-to-build-image closed and reopened replay M' closed-replay)"
+          api -X PATCH "repos/${REPO}/pulls/${PR_NUMBER}" -f state=closed > evidence/close-pr-response.json
+          move_ref "$M_SHA" false closed-fast-forward-to-M
+          snapshot_current closed-before-reopen "$CLOSED_COMMENT_AT"
+          (sleep 0.50; api -X PATCH "repos/${REPO}/pulls/${PR_NUMBER}" -f state=open \
+            > evidence/reopen-pr-response.json) &
+          REOPEN_PID=$!
+          wait_for_head_and_decide "$M_SHA" "$CLOSED_COMMENT_AT" reopened-M-first-observation || true
+          wait "$REOPEN_PID"
+          wait_for_run_after "$M_SHA" "$CLOSED_COMMENT_AT" reopened-new-M-run || true
+          snapshot_current reopened-M-after-run-visible "$CLOSED_COMMENT_AT"
+
+          jq -n \
+            --arg generated_at "$(now)" --arg repo "$REPO" --arg pr "$PR_NUMBER" \
+            --arg b "$B_SHA" --arg m "$M_SHA" --arg n "$N_SHA" \
+            --slurpfile baseline evidence/baseline-unchanged-B-decision.json \
+            --slurpfile open_first evidence/open-replay-first-observation-decision.json \
+            --slurpfile open_after evidence/open-replay-after-run-visible-decision.json \
+            --slurpfile fresh_first evidence/fresh-N-first-observation-decision.json \
+            --slurpfile fresh_after evidence/fresh-N-after-run-visible-decision.json \
+            --slurpfile closed evidence/closed-before-reopen-decision.json \
+            --slurpfile reopened_first evidence/reopened-M-first-observation-decision.json \
+            --slurpfile reopened_after evidence/reopened-M-after-run-visible-decision.json \
+            '{generated_at:$generated_at,repository:$repo,pr_number:($pr|tonumber),B:$b,M:$m,N:$n,
+              baseline:$baseline[0],open_first:$open_first[0],open_after:$open_after[0],
+              fresh_first:$fresh_first[0],fresh_after:$fresh_after[0],closed:$closed[0],
+              reopened_first:$reopened_first[0],reopened_after:$reopened_after[0]}' \
+            > evidence/summary.json
+          cat evidence/summary.json
+
+      - name: Upload raw evidence
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: historical-sha-replay-evidence-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 1
