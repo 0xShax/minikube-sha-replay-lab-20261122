@@ -1,15 +1,18 @@
-name: Historical SHA replay lab
+name: Source-faithful minikube approval replay
 
 on:
   workflow_dispatch:
+  issue_comment:
+    types: [created]
   pull_request:
     types: [opened, synchronize, reopened]
 
 permissions:
-  actions: read
-  contents: write
-  issues: write
-  pull-requests: write
+  contents: read
+
+env:
+  STATUS_CONTEXT: Kicbase / build
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 jobs:
   observer:
@@ -24,272 +27,362 @@ jobs:
           printf 'observer_at=%s\naction=%s\nhead_sha=%s\n' \
             "$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" "$EVENT_ACTION" "$EVENT_HEAD_SHA"
 
-  lab:
-    if: github.event_name == 'workflow_dispatch'
+  source-faithful-check:
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request != null &&
+      contains(github.event.comment.body, 'ok-to-build-image') &&
+      (
+        github.event.comment.user.login == 'minikube-bot' ||
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      )
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-      LAB_BRANCH: replay-pr
+    concurrency:
+      group: ${{ github.workflow }}-pr-${{ github.event.issue.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      statuses: write
+      pull-requests: write
     steps:
-      - name: Run harmless replay validation
-        id: lab
-        shell: bash
+      - name: Verify comment author is in OWNERS
+        if: github.event_name == 'issue_comment' && github.event.comment.user.login != 'minikube-bot' && github.event.comment.author_association != 'OWNER'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+        run: |
+          if ! gh api "repos/${GITHUB_REPOSITORY}/contents/OWNERS" -H "Accept: application/vnd.github.raw" | yq '.reviewers[], .approvers[]' | grep -qix "${COMMENT_USER}"; then
+            echo "User ${COMMENT_USER} is not in OWNERS reviewers or approvers" && exit 1
+          fi
+
+      - name: Validate input
+        id: input
+        env:
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          case "${PR_NUMBER}" in
+            '' | *[!0-9]*)
+              echo "::error::Invalid PR number '${PR_NUMBER}': expected a number" && exit 1
+              ;;
+          esac
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record real issue_comment event and authorization
+        env:
+          COMMENT_ASSOCIATION: ${{ github.event.comment.author_association }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_LOGIN: ${{ github.event.comment.user.login }}
+          EVENT_ACTION: ${{ github.event.action }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p evidence
-          REPO="${GITHUB_REPOSITORY}"
+          cp "$GITHUB_EVENT_PATH" evidence/issue-comment-event.json
+          gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" > evidence/comment-api.json
+          jq -n \
+            --arg event_name "$GITHUB_EVENT_NAME" --arg action "$EVENT_ACTION" \
+            --arg login "$COMMENT_LOGIN" --arg association "$COMMENT_ASSOCIATION" \
+            --arg body "$COMMENT_BODY" \
+            --argjson is_pr '${{ github.event.issue.pull_request != null }}' \
+            --argjson job_gate_authorized '${{ github.event.comment.user.login == 'minikube-bot' || contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) }}' \
+            '{event_name:$event_name,action:$action,is_pull_request:$is_pr,
+              comment:{login:$login,author_association:$association,body:$body},
+              job_gate_authorized:$job_gate_authorized,
+              owners_step_required:($login != "minikube-bot" and $association != "OWNER")}' \
+            > evidence/authorization.json
 
+      # This is test orchestration only. It gives the controller a precise point
+      # immediately before minikube's unchanged Resolve and verify PR head logic.
+      - name: Race synchronization barrier
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          set -euo pipefail
+          READY_CONTEXT="replay-lab/ready-${COMMENT_ID}"
+          GO_CONTEXT="replay-lab/go-${COMMENT_ID}"
+          gh api --silent -X POST "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state=pending -f context="$READY_CONTEXT" -f description='source check ready'
+          for i in $(seq 1 600); do
+            if gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/statuses?per_page=100" \
+              --jq ".[] | select(.context == \"${GO_CONTEXT}\" and .state == \"success\") | .id" | grep -q .; then
+              date -u +'%Y-%m-%dT%H:%M:%S.%NZ' > evidence/barrier-released-at.txt
+              exit 0
+            fi
+            sleep 0.10
+          done
+          echo 'controller did not release race barrier' > evidence/barrier-error.txt
+          exit 1
+
+      - name: Resolve and verify PR head
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.input.outputs.pr_number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AT: ${{ github.event.comment.created_at }}
+        run: |
+          set -euo pipefail
           now() { date -u +'%Y-%m-%dT%H:%M:%S.%NZ'; }
-
-          api() {
-            gh api -H 'Accept: application/vnd.github+json' "$@"
+          fail() {
+            local short="$1" detail="${2:-}"
+            jq -n --arg decision REJECT --arg reason "$short" --arg detail "$detail" \
+              '{decision:$decision,reason:$reason,detail:$detail}' > evidence/decision.json
+            echo "failure_reason=$short" >> "$GITHUB_OUTPUT"
+            echo "::error::$short $detail"
+            exit 1
           }
 
-          create_blob() {
-            api -X POST "repos/${REPO}/git/blobs" -f content="$1" -f encoding=utf-8 --jq .sha
-          }
+          PR_VIEW_STARTED_AT="$(now)"
+          HEAD_SHA=$(gh pr view "${PR_NUMBER}" --json headRefOid --jq '.headRefOid')
+          PR_REPO=$(gh pr view "${PR_NUMBER}" --json headRepositoryOwner,headRepository --jq '.headRepositoryOwner.login + "/" + .headRepository.name')
+          PR_VIEW_RECEIVED_AT="$(now)"
+          gh pr view "${PR_NUMBER}" --json number,state,headRefName,headRefOid,headRepositoryOwner,headRepository,url \
+            > evidence/gh-pr-view.json
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
 
-          create_tree() {
-            local base_tree="$1" blob="$2"
-            api -X POST "repos/${REPO}/git/trees" \
-              -f base_tree="$base_tree" \
-              -f 'tree[][path]=marker.txt' \
-              -f 'tree[][mode]=100644' \
-              -f 'tree[][type]=blob' \
-              -f "tree[][sha]=${blob}" --jq .sha
-          }
+          gh api --silent -X POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending -f context="${STATUS_CONTEXT}" -f target_url="${RUN_URL}" \
+            -f description="Building kicbase image..."
 
-          create_commit() {
-            local message="$1" tree="$2" parent="$3"
-            api -X POST "repos/${REPO}/git/commits" \
-              -f message="$message" -f tree="$tree" -f "parents[]=${parent}" --jq .sha
-          }
+          APPROVED_SHA=$(echo "${COMMENT_BODY}" | tr -d '\r' | awk '/ok-to-build-image/ {print $2; exit}')
+          OLD_EXAMPLE_APPROVED_SHA=$(printf '%s\n' 'ok-to-build-image open replay M' | awk '/ok-to-build-image/ {print $2; exit}')
+          jq -n --arg comment_body "$COMMENT_BODY" --arg approved_sha "$APPROVED_SHA" \
+            --arg old_example_approved_sha "$OLD_EXAMPLE_APPROVED_SHA" --arg head_sha "$HEAD_SHA" \
+            '{comment_body:$comment_body,approved_sha:$approved_sha,head_sha:$head_sha,
+              selected_path:(if $approved_sha == "" then "unpinned-timestamp" else "explicit-sha" end),
+              prior_harness_control:{comment:"ok-to-build-image open replay M",
+                parsed_approved_sha:$old_example_approved_sha,
+                would_match_head:($old_example_approved_sha == $head_sha)}}' \
+            > evidence/comment-parsing.json
 
-          move_ref() {
-            local sha="$1" force="$2" label="$3"
-            local started response completed
-            started="$(now)"
-            response="$(api -X PATCH "repos/${REPO}/git/refs/heads/${LAB_BRANCH}" \
-              -f sha="$sha" -F force="$force")"
-            completed="$(now)"
-            jq -n --arg label "$label" --arg started "$started" --arg completed "$completed" \
-              --argjson response "$response" \
-              '{label:$label,request_started_at:$started,response_received_at:$completed,response:$response}' \
-              > "evidence/${label}-ref-update.json"
-          }
-
-          create_comment() {
-            local body="$1" label="$2" response
-            response="$(api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" -f body="$body")"
-            printf '%s\n' "$response" > "evidence/${label}-comment.json"
-            jq -r .created_at <<<"$response"
-          }
-
-          runs_for_sha() {
-            api "repos/${REPO}/actions/runs?head_sha=$1&event=pull_request&per_page=100"
-          }
-
-          wait_for_any_run() {
-            local sha="$1" label="$2" i response count
-            for i in $(seq 1 160); do
-              response="$(runs_for_sha "$sha")"
-              count="$(jq '.workflow_runs | length' <<<"$response")"
-              if [[ "$count" -gt 0 ]]; then
-                jq -n --arg observed_at "$(now)" --arg sha "$sha" --argjson response "$response" \
-                  '{observed_at:$observed_at,sha:$sha,response:$response}' \
-                  > "evidence/${label}-first-visible-runs.json"
-                return 0
+          LATE_FORCE_PUSH='not-queried-explicit-path'
+          LAST_PUSHED_AT='not-queried-explicit-path'
+          if [ -n "${COMMENT_BODY}" ] && [ "${PR_REPO}" != "minikube-bot/minikube" ]; then
+            if [ -n "${APPROVED_SHA}" ]; then
+              if [ "${HEAD_SHA}" != "${APPROVED_SHA}" ]; then
+                fail "PR head does not match the approved SHA; comment ok-to-build-image again" "head=${HEAD_SHA} approved=${APPROVED_SHA}"
               fi
-              sleep 0.25
-            done
-            jq -n --arg observed_at "$(now)" --arg sha "$sha" \
-              '{observed_at:$observed_at,sha:$sha,error:"no pull_request run became visible"}' \
-              > "evidence/${label}-first-visible-runs.json"
-            return 1
-          }
-
-          wait_for_run_after() {
-            local sha="$1" after="$2" label="$3" i response count
-            for i in $(seq 1 160); do
-              response="$(runs_for_sha "$sha")"
-              count="$(jq --arg after "$after" '[.workflow_runs[] | select(.created_at > $after)] | length' <<<"$response")"
-              if [[ "$count" -gt 0 ]]; then
-                jq -n --arg observed_at "$(now)" --arg sha "$sha" --arg after "$after" \
-                  --argjson response "$response" \
-                  '{observed_at:$observed_at,sha:$sha,required_after:$after,response:$response}' \
-                  > "evidence/${label}-first-visible-runs.json"
-                return 0
-              fi
-              sleep 0.25
-            done
-            jq -n --arg observed_at "$(now)" --arg sha "$sha" --arg after "$after" \
-              '{observed_at:$observed_at,sha:$sha,required_after:$after,error:"no later pull_request run became visible"}' \
-              > "evidence/${label}-first-visible-runs.json"
-            return 1
-          }
-
-          capture_decision_from_pr() {
-            local label="$1" comment_at="$2" pr_observed_at="$3" pr_json="$4"
-            local head_sha runs_started_at runs_json runs_received_at branch_ref_json
-            local branch_ref_at pull_ref_at pull_ref last_run decision reason marker_b64 marker
-            head_sha="$(jq -r .head.sha <<<"$pr_json")"
-            runs_started_at="$(now)"
-            runs_json="$(runs_for_sha "$head_sha")"
-            runs_received_at="$(now)"
-            last_run="$(jq -r '[.workflow_runs[].created_at] | max // empty' <<<"$runs_json")"
-            if [[ -z "$last_run" ]]; then
-              decision=REJECT
-              reason=no-pull-request-run
-            elif [[ "$last_run" > "$comment_at" ]]; then
-              decision=REJECT
-              reason=latest-run-is-later
             else
-              decision=ACCEPT
-              reason=no-run-is-strictly-later
-            fi
-            branch_ref_at="$(now)"
-            branch_ref_json="$(api "repos/${REPO}/git/ref/heads/${LAB_BRANCH}")"
-            pull_ref_at="$(now)"
-            pull_ref="$(git ls-remote "https://github.com/${REPO}.git" "refs/pull/${PR_NUMBER}/head" || true)"
-            marker='not-read'
-            if [[ "$decision" == ACCEPT ]]; then
-              marker_b64="$(api "repos/${REPO}/contents/marker.txt?ref=${head_sha}" --jq .content | tr -d '\n')"
-              marker="$(printf '%s' "$marker_b64" | base64 -d)"
-            fi
-            jq -n \
-              --arg label "$label" --arg comment_at "$comment_at" \
-              --arg pr_observed_at "$pr_observed_at" --arg runs_started_at "$runs_started_at" \
-              --arg runs_received_at "$runs_received_at" --arg branch_ref_at "$branch_ref_at" \
-              --arg pull_ref_at "$pull_ref_at" --arg pull_ref "$pull_ref" \
-              --arg last_run "$last_run" --arg decision "$decision" --arg reason "$reason" \
-              --arg marker "$marker" --argjson pr "$pr_json" --argjson runs "$runs_json" \
-              --argjson branch_ref "$branch_ref_json" \
-              '{label:$label,comment_at:$comment_at,pr_observed_at:$pr_observed_at,
-                runs_request_started_at:$runs_started_at,runs_response_received_at:$runs_received_at,
-                branch_ref_observed_at:$branch_ref_at,pull_ref_observed_at:$pull_ref_at,
-                decision:$decision,reason:$reason,last_run_created_at:$last_run,marker:$marker,
-                pr:$pr,branch_ref:$branch_ref,pull_ref_ls_remote:$pull_ref,runs:$runs}' \
-              > "evidence/${label}-decision.json"
-            cat "evidence/${label}-decision.json"
-          }
-
-          wait_for_head_and_decide() {
-            local expected="$1" comment_at="$2" label="$3" i observed pr_json actual
-            for i in $(seq 1 300); do
-              observed="$(now)"
-              pr_json="$(api "repos/${REPO}/pulls/${PR_NUMBER}")"
-              actual="$(jq -r .head.sha <<<"$pr_json")"
-              if [[ "$actual" == "$expected" ]]; then
-                capture_decision_from_pr "$label" "$comment_at" "$observed" "$pr_json"
-                return 0
+              gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/events?per_page=100" \
+                > evidence/pr-events.json
+              LATE_FORCE_PUSH=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/events?per_page=100" \
+                --jq ".[] | select(.event == \"head_ref_force_pushed\" and .created_at > \"${COMMENT_AT}\") | .created_at" | head -n1)
+              if [ -n "${LATE_FORCE_PUSH}" ]; then
+                fail "PR was force pushed after the approval comment; comment ok-to-build-image again" "force_pushed=${LATE_FORCE_PUSH} comment=${COMMENT_AT}"
               fi
-              sleep 0.10
-            done
-            jq -n --arg observed_at "$(now)" --arg expected "$expected" \
-              '{observed_at:$observed_at,expected:$expected,error:"expected head never observed"}' \
-              > "evidence/${label}-decision.json"
-            return 1
-          }
-
-          snapshot_current() {
-            local label="$1" comment_at="$2" observed pr_json
-            observed="$(now)"
-            pr_json="$(api "repos/${REPO}/pulls/${PR_NUMBER}")"
-            capture_decision_from_pr "$label" "$comment_at" "$observed" "$pr_json"
-          }
-
-          MAIN_SHA="$(api "repos/${REPO}/git/ref/heads/main" --jq .object.sha)"
-          MAIN_TREE="$(api "repos/${REPO}/git/commits/${MAIN_SHA}" --jq .tree.sha)"
-          B_BLOB="$(create_blob 'BENIGN_APPROVED_REVISION')"
-          B_TREE="$(create_tree "$MAIN_TREE" "$B_BLOB")"
-          B_SHA="$(create_commit 'lab: benign approved parent B' "$B_TREE" "$MAIN_SHA")"
-          M_BLOB="$(create_blob 'RESTORED_UNAUTHORIZED_REVISION')"
-          M_TREE="$(create_tree "$B_TREE" "$M_BLOB")"
-          M_SHA="$(create_commit 'lab: harmless restored child M' "$M_TREE" "$B_SHA")"
-          N_BLOB="$(create_blob 'NEW_UNSEEN_POST_APPROVAL_REVISION')"
-          N_TREE="$(create_tree "$B_TREE" "$N_BLOB")"
-          N_SHA="$(create_commit 'lab: harmless never-before-seen child N' "$N_TREE" "$B_SHA")"
-          jq -n --arg main "$MAIN_SHA" --arg b "$B_SHA" --arg m "$M_SHA" --arg n "$N_SHA" \
-            '{main:$main,B:$b,M:$m,N:$n}' > evidence/commit-shas.json
-
-          api -X DELETE "repos/${REPO}/git/refs/heads/${LAB_BRANCH}" >/dev/null 2>&1 || true
-          api -X POST "repos/${REPO}/git/refs" -f "ref=refs/heads/${LAB_BRANCH}" -f sha="$M_SHA" \
-            > evidence/create-branch-response.json
-          PR_JSON="$(api -X POST "repos/${REPO}/pulls" -f title='Disposable historical SHA replay validation' \
-            -f head="$LAB_BRANCH" -f base=main \
-            -f body='Harmless automated validation. No secrets, releases, packages, or publication.')"
-          printf '%s\n' "$PR_JSON" > evidence/create-pr-response.json
-          PR_NUMBER="$(jq -r .number <<<"$PR_JSON")"
-          printf '%s\n' "$PR_NUMBER" > evidence/pr-number.txt
-
-          if ! wait_for_any_run "$M_SHA" initial-M; then
-            jq -n --arg verdict BLOCKED --arg reason 'GITHUB_TOKEN-created PR produced no pull_request run' \
-              '{verdict:$verdict,reason:$reason}' > evidence/summary.json
-            cat evidence/summary.json
-            exit 0
+              RUNS_REQUEST_STARTED_AT="$(now)"
+              gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${HEAD_SHA}&event=pull_request&per_page=100" \
+                > evidence/runs-api.json
+              RUNS_RESPONSE_RECEIVED_AT="$(now)"
+              LAST_PUSHED_AT=$(jq -r '[.workflow_runs[].created_at] | max // empty' evidence/runs-api.json)
+              if [ -z "${LAST_PUSHED_AT}" ]; then
+                fail "Could not determine when the PR head was pushed; comment ok-to-build-image ${HEAD_SHA:0:12}" "head=${HEAD_SHA} (no pull_request workflow runs found)"
+              fi
+              if [ "${LAST_PUSHED_AT}" \> "${COMMENT_AT}" ]; then
+                fail "PR head was pushed after the approval comment; comment ok-to-build-image again" "head=${HEAD_SHA} pushed=${LAST_PUSHED_AT} comment=${COMMENT_AT}"
+              fi
+            fi
           fi
 
-          move_ref "$B_SHA" true reset-to-B-before-approval
-          wait_for_any_run "$B_SHA" reset-B || true
-
-          BASELINE_COMMENT_AT="$(create_comment 'ok-to-build-image baseline unchanged B' baseline)"
-          snapshot_current baseline-unchanged-B "$BASELINE_COMMENT_AT"
-
-          OPEN_COMMENT_AT="$(create_comment 'ok-to-build-image open replay M' open-replay)"
-          (sleep 0.50; move_ref "$M_SHA" false open-fast-forward-to-M) &
-          OPEN_UPDATE_PID=$!
-          wait_for_head_and_decide "$M_SHA" "$OPEN_COMMENT_AT" open-replay-first-observation || true
-          wait "$OPEN_UPDATE_PID"
-          wait_for_run_after "$M_SHA" "$OPEN_COMMENT_AT" open-new-M-run || true
-          snapshot_current open-replay-after-run-visible "$OPEN_COMMENT_AT"
-
-          move_ref "$B_SHA" true reset-to-B-for-fresh-control
-          wait_for_any_run "$B_SHA" fresh-control-B || true
-          FRESH_COMMENT_AT="$(create_comment 'ok-to-build-image fresh unseen N control' fresh-control)"
-          (sleep 0.50; move_ref "$N_SHA" false fresh-fast-forward-to-N) &
-          FRESH_UPDATE_PID=$!
-          wait_for_head_and_decide "$N_SHA" "$FRESH_COMMENT_AT" fresh-N-first-observation || true
-          wait "$FRESH_UPDATE_PID"
-          wait_for_run_after "$N_SHA" "$FRESH_COMMENT_AT" fresh-new-N-run || true
-          snapshot_current fresh-N-after-run-visible "$FRESH_COMMENT_AT"
-
-          move_ref "$B_SHA" true reset-to-B-for-closed
-          wait_for_any_run "$B_SHA" closed-control-B || true
-          CLOSED_COMMENT_AT="$(create_comment 'ok-to-build-image closed and reopened replay M' closed-replay)"
-          api -X PATCH "repos/${REPO}/pulls/${PR_NUMBER}" -f state=closed > evidence/close-pr-response.json
-          move_ref "$M_SHA" false closed-fast-forward-to-M
-          snapshot_current closed-before-reopen "$CLOSED_COMMENT_AT"
-          (sleep 0.50; api -X PATCH "repos/${REPO}/pulls/${PR_NUMBER}" -f state=open \
-            > evidence/reopen-pr-response.json) &
-          REOPEN_PID=$!
-          wait_for_head_and_decide "$M_SHA" "$CLOSED_COMMENT_AT" reopened-M-first-observation || true
-          wait "$REOPEN_PID"
-          wait_for_run_after "$M_SHA" "$CLOSED_COMMENT_AT" reopened-new-M-run || true
-          snapshot_current reopened-M-after-run-visible "$CLOSED_COMMENT_AT"
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/replay-pr" > evidence/branch-ref.json
+          git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" "refs/pull/${PR_NUMBER}/head" \
+            > evidence/pull-ref-ls-remote.txt
+          FETCH_STARTED_AT="$(now)"
+          git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+          git checkout --detach "${HEAD_SHA}"
+          CHECKOUT_COMPLETED_AT="$(now)"
+          CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+          MARKER="$(cat marker.txt)"
 
           jq -n \
-            --arg generated_at "$(now)" --arg repo "$REPO" --arg pr "$PR_NUMBER" \
-            --arg b "$B_SHA" --arg m "$M_SHA" --arg n "$N_SHA" \
-            --slurpfile baseline evidence/baseline-unchanged-B-decision.json \
-            --slurpfile open_first evidence/open-replay-first-observation-decision.json \
-            --slurpfile open_after evidence/open-replay-after-run-visible-decision.json \
-            --slurpfile fresh_first evidence/fresh-N-first-observation-decision.json \
-            --slurpfile fresh_after evidence/fresh-N-after-run-visible-decision.json \
-            --slurpfile closed evidence/closed-before-reopen-decision.json \
-            --slurpfile reopened_first evidence/reopened-M-first-observation-decision.json \
-            --slurpfile reopened_after evidence/reopened-M-after-run-visible-decision.json \
-            '{generated_at:$generated_at,repository:$repo,pr_number:($pr|tonumber),B:$b,M:$m,N:$n,
-              baseline:$baseline[0],open_first:$open_first[0],open_after:$open_after[0],
-              fresh_first:$fresh_first[0],fresh_after:$fresh_after[0],closed:$closed[0],
-              reopened_first:$reopened_first[0],reopened_after:$reopened_after[0]}' \
-            > evidence/summary.json
-          cat evidence/summary.json
+            --arg decision ACCEPT --arg reason source-faithful-check-passed \
+            --arg comment_at "$COMMENT_AT" --arg comment_body "$COMMENT_BODY" \
+            --arg approved_sha "$APPROVED_SHA" --arg head_sha "$HEAD_SHA" --arg pr_repo "$PR_REPO" \
+            --arg late_force_push "$LATE_FORCE_PUSH" --arg last_pushed_at "$LAST_PUSHED_AT" \
+            --arg pr_view_started_at "$PR_VIEW_STARTED_AT" --arg pr_view_received_at "$PR_VIEW_RECEIVED_AT" \
+            --arg runs_request_started_at "${RUNS_REQUEST_STARTED_AT:-not-run}" \
+            --arg runs_response_received_at "${RUNS_RESPONSE_RECEIVED_AT:-not-run}" \
+            --arg fetch_started_at "$FETCH_STARTED_AT" --arg checkout_completed_at "$CHECKOUT_COMPLETED_AT" \
+            --arg checked_out_sha "$CHECKED_OUT_SHA" --arg marker "$MARKER" \
+            '{decision:$decision,reason:$reason,comment_at:$comment_at,comment_body:$comment_body,
+              approved_sha:$approved_sha,head_sha:$head_sha,pr_repo:$pr_repo,
+              late_force_push:$late_force_push,last_pushed_at:$last_pushed_at,
+              pr_view_started_at:$pr_view_started_at,pr_view_received_at:$pr_view_received_at,
+              runs_request_started_at:$runs_request_started_at,
+              runs_response_received_at:$runs_response_received_at,
+              fetch_started_at:$fetch_started_at,checkout_completed_at:$checkout_completed_at,
+              checked_out_sha:$checked_out_sha,marker:$marker}' > evidence/decision.json
+          cat evidence/decision.json
 
-      - name: Upload raw evidence
+      - name: Upload source-faithful evidence
         if: always()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
         with:
-          name: historical-sha-replay-evidence-${{ github.run_id }}
+          name: source-faithful-evidence-${{ github.run_id }}
           path: evidence/
+          if-no-files-found: warn
+          retention-days: 1
+
+  controller:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      issues: read
+      pull-requests: read
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: '1'
+      LAB_BRANCH: replay-pr
+      B_SHA: aaef844c81ae53fc46632964d4186bb889a5554d
+      M_SHA: 0909609fefe17479553fec179be97369e1abaa0d
+    steps:
+      - name: Prepare and orchestrate source-faithful race
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p controller-evidence
+          REPO="$GITHUB_REPOSITORY"
+          now() { date -u +'%Y-%m-%dT%H:%M:%S.%NZ'; }
+          api() { gh api -H 'Accept: application/vnd.github+json' "$@"; }
+
+          STARTED_AT="$(now)"
+          MAIN_SHA="$(api "repos/${REPO}/git/ref/heads/main" --jq .object.sha)"
+          M_PARENT="$(api "repos/${REPO}/git/commits/${M_SHA}" --jq '.parents[0].sha')"
+          if [ "$M_PARENT" != "$B_SHA" ]; then
+            echo "M is not a direct child of B" >&2
+            exit 1
+          fi
+          jq -n --arg started_at "$STARTED_AT" --arg main "$MAIN_SHA" \
+            --arg b "$B_SHA" --arg m "$M_SHA" --arg m_parent "$M_PARENT" \
+            '{started_at:$started_at,main:$main,B:$b,M:$m,M_parent:$m_parent}' \
+            > controller-evidence/revisions.json
+
+          RESET_STARTED_AT="$(now)"
+          api -X PATCH "repos/${REPO}/git/refs/heads/${LAB_BRANCH}" -f sha="$B_SHA" -F force=true \
+            > controller-evidence/reset-to-B-response.json
+          RESET_RECEIVED_AT="$(now)"
+          jq -n --arg started_at "$RESET_STARTED_AT" --arg received_at "$RESET_RECEIVED_AT" \
+            '{request_started_at:$started_at,response_received_at:$received_at}' \
+            > controller-evidence/reset-to-B-timing.json
+
+          for i in $(seq 1 300); do
+            CURRENT="$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)"
+            if [ "$CURRENT" = "$B_SHA" ]; then
+              jq -n --arg observed_at "$(now)" --arg head_sha "$CURRENT" \
+                '{observed_at:$observed_at,head_sha:$head_sha}' \
+                > controller-evidence/B-head-visible.json
+              break
+            fi
+            sleep 0.10
+          done
+          if [ ! -s controller-evidence/B-head-visible.json ]; then
+            echo 'PR head B never became visible' >&2
+            exit 1
+          fi
+
+          printf 'Waiting for repository owner to post exact comment: ok-to-build-image\n'
+          COMMENT_JSON=''
+          for i in $(seq 1 1800); do
+            COMMENT_JSON="$(api "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" | \
+              jq -c --arg started "$STARTED_AT" \
+              '[.[] | select(.body == "ok-to-build-image" and .created_at >= $started)] | last // empty')"
+            if [ -n "$COMMENT_JSON" ]; then break; fi
+            sleep 0.25
+          done
+          if [ -z "$COMMENT_JSON" ]; then
+            echo 'exact owner comment did not arrive' >&2
+            exit 1
+          fi
+          printf '%s\n' "$COMMENT_JSON" > controller-evidence/exact-comment.json
+          COMMENT_ID="$(jq -r .id <<<"$COMMENT_JSON")"
+          COMMENT_AT="$(jq -r .created_at <<<"$COMMENT_JSON")"
+          COMMENT_ASSOCIATION="$(jq -r .author_association <<<"$COMMENT_JSON")"
+          if [[ "$COMMENT_ASSOCIATION" != OWNER && "$COMMENT_ASSOCIATION" != MEMBER && "$COMMENT_ASSOCIATION" != COLLABORATOR ]]; then
+            echo "comment author was not authorized: $COMMENT_ASSOCIATION" >&2
+            exit 1
+          fi
+
+          READY_CONTEXT="replay-lab/ready-${COMMENT_ID}"
+          for i in $(seq 1 1200); do
+            READY_ID="$(api "repos/${REPO}/commits/${MAIN_SHA}/statuses?per_page=100" \
+              --jq ".[] | select(.context == \"${READY_CONTEXT}\" and .state == \"pending\") | .id" | head -n1)"
+            if [ -n "$READY_ID" ]; then
+              jq -n --arg observed_at "$(now)" --arg id "$READY_ID" --arg context "$READY_CONTEXT" \
+                '{observed_at:$observed_at,status_id:($id|tonumber),context:$context}' \
+                > controller-evidence/source-check-ready.json
+              break
+            fi
+            sleep 0.10
+          done
+          if [ ! -s controller-evidence/source-check-ready.json ]; then
+            echo 'source-faithful issue_comment job never reached barrier' >&2
+            exit 1
+          fi
+
+          MOVE_STARTED_AT="$(now)"
+          api -X PATCH "repos/${REPO}/git/refs/heads/${LAB_BRANCH}" -f sha="$M_SHA" -F force=false \
+            > controller-evidence/fast-forward-to-M-response.json
+          MOVE_RECEIVED_AT="$(now)"
+          jq -n --arg started_at "$MOVE_STARTED_AT" --arg received_at "$MOVE_RECEIVED_AT" \
+            '{request_started_at:$started_at,response_received_at:$received_at}' \
+            > controller-evidence/fast-forward-to-M-timing.json
+
+          GO_POST_STARTED_AT="$(now)"
+          api --silent -X POST "repos/${REPO}/statuses/${MAIN_SHA}" \
+            -f state=success -f context="replay-lab/go-${COMMENT_ID}" -f description='branch moved to restored M'
+          GO_POST_RECEIVED_AT="$(now)"
+          jq -n --arg started_at "$GO_POST_STARTED_AT" --arg received_at "$GO_POST_RECEIVED_AT" \
+            '{request_started_at:$started_at,response_received_at:$received_at}' \
+            > controller-evidence/go-status-timing.json
+
+          api "repos/${REPO}/pulls/${PR_NUMBER}" > controller-evidence/pr-after-move.json
+          api "repos/${REPO}/git/ref/heads/${LAB_BRANCH}" > controller-evidence/branch-ref-after-move.json
+          git ls-remote "https://github.com/${REPO}.git" "refs/pull/${PR_NUMBER}/head" \
+            > controller-evidence/pull-ref-after-move.txt
+
+          for i in $(seq 1 1200); do
+            RUNS="$(api "repos/${REPO}/actions/workflows/replay-lab.yml/runs?event=issue_comment&per_page=20")"
+            SOURCE_RUN_ID="$(jq -r --arg comment_at "$COMMENT_AT" \
+              '[.workflow_runs[] | select(.created_at >= $comment_at)] | first | .id // empty' <<<"$RUNS")"
+            SOURCE_STATUS="$(jq -r --argjson id "${SOURCE_RUN_ID:-0}" \
+              '.workflow_runs[] | select(.id == $id) | .status // empty' <<<"$RUNS")"
+            if [ -n "$SOURCE_RUN_ID" ] && [ "$SOURCE_STATUS" = completed ]; then
+              printf '%s\n' "$RUNS" > controller-evidence/issue-comment-runs-completed.json
+              printf '%s\n' "$SOURCE_RUN_ID" > controller-evidence/source-run-id.txt
+              break
+            fi
+            sleep 0.25
+          done
+
+          for i in $(seq 1 1200); do
+            M_RUNS="$(api "repos/${REPO}/actions/runs?head_sha=${M_SHA}&event=pull_request&per_page=100")"
+            NEW_COUNT="$(jq --arg comment_at "$COMMENT_AT" '[.workflow_runs[] | select(.created_at > $comment_at)] | length' <<<"$M_RUNS")"
+            if [ "$NEW_COUNT" -gt 0 ]; then
+              jq -n --arg observed_at "$(now)" --arg comment_at "$COMMENT_AT" \
+                --argjson response "$M_RUNS" \
+                '{observed_at:$observed_at,comment_at:$comment_at,response:$response}' \
+                > controller-evidence/new-M-run-first-visible.json
+              break
+            fi
+            sleep 0.10
+          done
+
+      - name: Upload controller evidence
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: source-faithful-controller-${{ github.run_id }}
+          path: controller-evidence/
           if-no-files-found: warn
           retention-days: 1
