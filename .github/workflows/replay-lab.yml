@@ -141,11 +141,13 @@ jobs:
           }
 
           PR_VIEW_STARTED_AT="$(now)"
-          HEAD_SHA=$(gh pr view "${PR_NUMBER}" --json headRefOid --jq '.headRefOid')
-          PR_REPO=$(gh pr view "${PR_NUMBER}" --json headRepositoryOwner,headRepository --jq '.headRepositoryOwner.login + "/" + .headRepository.name')
+          HEAD_VIEW_JSON="$(gh pr view "${PR_NUMBER}" --json headRefOid)"
+          printf '%s\n' "$HEAD_VIEW_JSON" > evidence/gh-pr-view-head-resolution.json
+          HEAD_SHA="$(jq -r .headRefOid <<<"$HEAD_VIEW_JSON")"
+          REPO_VIEW_JSON="$(gh pr view "${PR_NUMBER}" --json headRepositoryOwner,headRepository)"
+          printf '%s\n' "$REPO_VIEW_JSON" > evidence/gh-pr-view-repository-resolution.json
+          PR_REPO="$(jq -r '.headRepositoryOwner.login + "/" + .headRepository.name' <<<"$REPO_VIEW_JSON")"
           PR_VIEW_RECEIVED_AT="$(now)"
-          gh pr view "${PR_NUMBER}" --json number,state,headRefName,headRefOid,headRepositoryOwner,headRepository,url \
-            > evidence/gh-pr-view.json
           echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
 
           gh api --silent -X POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
@@ -337,6 +339,21 @@ jobs:
           jq -n --arg started_at "$MOVE_STARTED_AT" --arg received_at "$MOVE_RECEIVED_AT" \
             '{request_started_at:$started_at,response_received_at:$received_at}' \
             > controller-evidence/fast-forward-to-M-timing.json
+
+          for i in $(seq 1 600); do
+            RESOLVED_HEAD="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
+            if [ "$RESOLVED_HEAD" = "$M_SHA" ]; then
+              jq -n --arg observed_at "$(now)" --arg head_sha "$RESOLVED_HEAD" \
+                '{observed_at:$observed_at,head_sha:$head_sha,operation:"gh pr view --json headRefOid"}' \
+                > controller-evidence/M-head-visible-via-gh-pr-view.json
+              break
+            fi
+            sleep 0.05
+          done
+          if [ ! -s controller-evidence/M-head-visible-via-gh-pr-view.json ]; then
+            echo 'gh pr view did not resolve M after branch update' >&2
+            exit 1
+          fi
 
           GO_POST_STARTED_AT="$(now)"
           api --silent -X POST "repos/${REPO}/statuses/${MAIN_SHA}" \
