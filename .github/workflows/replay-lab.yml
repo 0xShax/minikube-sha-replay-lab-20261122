@@ -277,7 +277,7 @@ jobs:
             > controller-evidence/reset-to-B-timing.json
 
           for i in $(seq 1 300); do
-            CURRENT="$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)"
+            CURRENT="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
             if [ "$CURRENT" = "$B_SHA" ]; then
               jq -n --arg observed_at "$(now)" --arg head_sha "$CURRENT" \
                 '{observed_at:$observed_at,head_sha:$head_sha}' \
