@@ -212,6 +212,7 @@ jobs:
           jq -n --arg main "$MAIN_SHA" --arg b "$B_SHA" --arg m "$M_SHA" --arg n "$N_SHA" \
             '{main:$main,B:$b,M:$m,N:$n}' > evidence/commit-shas.json
 
+          api -X DELETE "repos/${REPO}/git/refs/heads/${LAB_BRANCH}" >/dev/null 2>&1 || true
           api -X POST "repos/${REPO}/git/refs" -f "ref=refs/heads/${LAB_BRANCH}" -f sha="$M_SHA" \
             > evidence/create-branch-response.json
           PR_JSON="$(api -X POST "repos/${REPO}/pulls" -f title='Disposable historical SHA replay validation' \
